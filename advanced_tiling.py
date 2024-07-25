@@ -2,27 +2,12 @@ from typing import Optional
 import functools
 import copy
 
-from .modes import modes
+from .modes import modes, Settings
+import torch
 from torch import Tensor
 from torch.nn import Conv2d
 from torch.nn import functional as F
 from torch.nn.modules.utils import _pair
-import numpy as np
-
-
-class Settings:
-    """
-    For representing tiling settings
-    """
-
-    def __init__(self, mode, rotation):
-        self.mode = mode
-        self.tiling_fn = modes[mode]
-        self.rotation = rotation
-
-    def __hash__(self):
-        # We don't care about the tiling function, because it's determined by the mode
-        return hash((self.mode, self.rotation))
 
 
 @functools.cache
@@ -47,7 +32,7 @@ def calculate_mapping(
 
 
 @functools.cache
-def crop_image(image, settings: Settings):
+def create_crop_mask(width: int, height: int, settings: Settings):
     """
     Crop image based on tiling settings
 
@@ -56,10 +41,7 @@ def crop_image(image, settings: Settings):
     :return: Cropped image
     """
 
-    height, width = image.shape[1:3]
-    with_alpha = F.pad(image, (0, 1), "constant", 0)
-    print("size", height, width)
-
+    mask = torch.zeros((1, height, width, 1), dtype=torch.float32)
     for y in range(height):
         for x in range(width):
             # Calculate new coordinates
@@ -67,14 +49,16 @@ def crop_image(image, settings: Settings):
 
             # If coordinates match, it means we are in the mask
             if new_x == x and new_y == y:
-                with_alpha[:, y, x, -1] = 1
-
-    return with_alpha
+                mask[:, y, x] = 1
+    return mask
 
 
 def patch_model(model, settings: Settings):
     """
-    TODO
+    Patch model to perform tiling - in place!
+
+    :param model: Model to patch
+    :param settings: Tiling settings
     """
 
     # Patch all Conv2d layers
@@ -82,12 +66,17 @@ def patch_model(model, settings: Settings):
         # pylint: disable=protected-access, no-value-for-parameter
         layer._conv_forward = tiling_conv.__get__(layer, Conv2d)
         layer.tiling_settings = settings
-    return model
+    return
 
 
 def tiling_conv(self, input_tensor: Tensor, weight: Tensor, bias: Optional[Tensor]):
     """
-    TODO
+    Patched Conv2D forward function for tiling
+
+    :param input_tensor: Input tensor
+    :param weight: Weight tensor
+    :param bias: Bias tensor
+    :return: Convolution result
     """
 
     # Pad input tensor
@@ -117,7 +106,9 @@ class AdvancedTilingSettings:
 
     @classmethod
     def INPUT_TYPES(cls):
-        """TODO"""
+        """
+        Input types for the node
+        """
 
         return {
             "required": {
@@ -135,7 +126,7 @@ class AdvancedTilingSettings:
 
     def run(self, mode, rotation):
         """
-        TODO
+        Creates tiling settings from node inputs
         """
 
         settings = Settings(mode, rotation)
@@ -152,7 +143,9 @@ class AdvancedTiling:
 
     @classmethod
     def INPUT_TYPES(cls):
-        """TODO"""
+        """
+        Input types for the node
+        """
 
         return {
             "required": {
@@ -177,7 +170,9 @@ class AdvancedTiling:
 
 
 class AdvancedTilingVAEDecode:
-    """TODO"""
+    """
+    Input types for the node
+    """
 
     # pylint: disable=invalid-name
 
@@ -199,9 +194,16 @@ class AdvancedTilingVAEDecode:
     CATEGORY = "latent"
 
     def run(self, settings, samples, vae, crop):
-        """TODO"""
+        """
+        Decode latents to image with tiling
+        Optionally crop the image based on tiling settings
 
-        print("settings", settings)
+        :param settings: Tiling settings
+        :param samples: Latent samples
+        :param vae: VAE model
+        :param crop: Whether to crop the image
+        :return: Final image
+        """
 
         vae_copy = copy.deepcopy(vae)
         # Enable tiling
@@ -210,6 +212,7 @@ class AdvancedTilingVAEDecode:
         image = vae_copy.decode(samples["samples"])
         if crop:
             # Crop image based on tiling settings
-            image = crop_image(image, settings)
+            mask = create_crop_mask(image.shape[2], image.shape[1], settings)
+            image = torch.cat((image, mask), dim=3)
 
         return (image,)

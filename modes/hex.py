@@ -5,6 +5,7 @@ Some of this code is taken from excelent guide https://www.redblobgames.com/grid
 """
 
 import math
+from . import Settings
 
 
 def cube_to_axial(cube_coords: tuple[int, int, int]) -> tuple[int, int]:
@@ -71,8 +72,23 @@ def cube_round(frac_coords: tuple[float, float, float]) -> tuple[int, int, int]:
 
 
 def hex_tiling(
-    x: int, y: int, original_size: tuple[int, int], padded_size: tuple[int, int]
+    x: int,
+    y: int,
+    original_size: tuple[int, int],
+    padded_size: tuple[int, int],
+    settings: Settings,
 ) -> tuple[int, int]:
+    """
+    Hexagonal tiling function
+
+    :param x: X coordinate
+    :param y: Y coordinate
+    :param original_size: Original size of tensor
+    :param padded_size: Padded size of tensor
+    :param settings: Tiling settings
+    :return (x, y): Coordinates
+    """
+
     ssize = padded_size[0] // 2
     size = original_size[0] // 2
 
