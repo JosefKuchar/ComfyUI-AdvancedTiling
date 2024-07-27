@@ -8,6 +8,6 @@ license = "GPL-3.0"
 Repository = "https://github.com/JosefKuchar/ComfyUI-AdvancedTiling"
 
 [tool.comfy]
-PublisherId = "JosefKuchar"
+PublisherId = "josefkuchar"
 DisplayName = "ComfyUI-AdvancedTiling"
 Icon = ""
