@@ -1,13 +1,17 @@
+"""
+Main advanced tiling implementation
+"""
+
 from typing import Optional
 import functools
 import copy
 
-from .modes import modes, Settings
 import torch
 from torch import Tensor
 from torch.nn import Conv2d
 from torch.nn import functional as F
 from torch.nn.modules.utils import _pair
+from .modes import modes, Settings
 
 
 @functools.cache
@@ -26,7 +30,9 @@ def calculate_mapping(
     mapping = []
     for y in range(padded_size[1]):
         for x in range(padded_size[0]):
-            (new_x, new_y) = settings.tiling_fn(x, y, original_size, padded_size)
+            (new_x, new_y) = settings.tiling_fn(
+                x, y, original_size, padded_size, settings
+            )
             mapping.append([x, y, new_x, new_y])
     return list(zip(*mapping))
 
@@ -45,7 +51,9 @@ def create_crop_mask(width: int, height: int, settings: Settings):
     for y in range(height):
         for x in range(width):
             # Calculate new coordinates
-            (new_x, new_y) = settings.tiling_fn(x, y, (width, height), (width, height))
+            (new_x, new_y) = settings.tiling_fn(
+                x, y, (width, height), (width, height), settings
+            )
 
             # If coordinates match, it means we are in the mask
             if new_x == x and new_y == y:
@@ -94,13 +102,16 @@ def tiling_conv(self, input_tensor: Tensor, weight: Tensor, bias: Optional[Tenso
     # Apply tiling
     padded[:, :, mapping[1], mapping[0]] = padded[:, :, mapping[3], mapping[2]]
     # Perform convolution
+    # pylint: disable=not-callable
     return F.conv2d(
         padded, weight, bias, self.stride, _pair(0), self.dilation, self.groups
     )
 
 
 class AdvancedTilingSettings:
-    """TODO"""
+    """
+    Tiling settings node that outputs tiling settings for other nodes
+    """
 
     # pylint: disable=invalid-name
 
@@ -178,7 +189,9 @@ class AdvancedTilingVAEDecode:
 
     @classmethod
     def INPUT_TYPES(cls):
-        """TODO"""
+        """
+        Input types for the node
+        """
 
         return {
             "required": {

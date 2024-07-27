@@ -1,4 +1,6 @@
-"""TODO"""
+"""
+ComfyUI Node entry point
+"""
 
 # pylint: disable=invalid-name
 
