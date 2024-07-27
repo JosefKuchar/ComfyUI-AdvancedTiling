@@ -1,0 +1,13 @@
+[project]
+name = "ComfyUI-AdvancedTiling"
+description = "Advanced tiling of various shapes for ComfyUI"
+version = "1.0.0"
+license = "GPL-3.0"
+
+[project.urls]
+Repository = "https://github.com/JosefKuchar/ComfyUI-AdvancedTiling"
+
+[tool.comfy]
+PublisherId = "JosefKuchar"
+DisplayName = "ComfyUI-AdvancedTiling"
+Icon = ""
