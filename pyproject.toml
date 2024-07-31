@@ -2,7 +2,7 @@
 name = "comfyui-advanced-tiling"
 description = "Advanced tiling of various shapes for ComfyUI"
 version = "1.0.0"
-license = "GPL-3.0"
+license = { text = "GNU General Public License v3.0" }
 
 [project.urls]
 Repository = "https://github.com/JosefKuchar/ComfyUI-AdvancedTiling"
