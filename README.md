@@ -11,10 +11,17 @@
 - [x] Hexagon
 - [x] None (normal generation)
 
+## Supported models
+
+- [x] Stable Diffusion 1.5 (also 1.4)
+- [x] Stable Diffusion 2.1 (also 2.0)
+- [x] Stable Diffusion XL (SDXL)
+
 ## TODO
 
 - More tiling modes
 - Optimize VAE decode (first pass is very slow)
+- Support DiT based models (SD3, PixArt-Σ, FLUX.1)
 
 ## Credits
 
