@@ -4,36 +4,48 @@ Rectangular (toroidal) tiling implementation
 Wraps coordinates modularly: right edge wraps to left, bottom wraps to top.
 """
 
-from . import Settings
+import math
 
 
 def rect_tiling(
     x: int,
     y: int,
-    original_size: tuple[int, int],
     padded_size: tuple[int, int],
-    _settings: Settings,
+    work_w: float,
+    work_h: float,
 ) -> tuple[int, int]:
-    """
-    Rectangular tiling: wraps coordinates modularly around the original area.
+    """Rectangular tiling with float-point dimensions.
 
-    Positions inside original_size are identity. Positions in the padding area
-    wrap to the opposite side of the original content.
+    Uses float modular arithmetic for wrapping, with rounding only at final output.
+    Pixels inside the float rectangle map to themselves.
+    Pixels outside wrap to the opposite side.
 
     :param x: X coordinate in padded space
     :param y: Y coordinate in padded space
-    :param original_size: (width, height) of original content
     :param padded_size: (width, height) of padded tensor
-    :param _settings: Tiling settings (unused for rectangular)
+    :param work_w: Working rectangle width (pre-computed at appropriate resolution)
+    :param work_h: Working rectangle height (pre-computed at appropriate resolution)
     :return: (new_x, new_y) source coordinates in padded space
     """
-
-    ow, oh = original_size
     pw, ph = padded_size
-    pad_x = (pw - ow) // 2
-    pad_y = (ph - oh) // 2
 
-    rel_x = (x - pad_x) % ow
-    rel_y = (y - pad_y) % oh
+    cx = pw / 2.0
+    cy = ph / 2.0
 
-    return (rel_x + pad_x, rel_y + pad_y)
+    rel_x = x - cx
+    rel_y = y - cy
+
+    new_x = cx + ((rel_x + work_w / 2) % work_w) - work_w / 2
+    new_y = cy + ((rel_y + work_h / 2) % work_h) - work_h / 2
+
+    return (math.floor(new_x + 0.5), math.floor(new_y + 0.5))
+
+
+def rect_tiling_at(x, y, padded_size, resolved):
+    """Rectangular tiling with automatic resolution scaling from ResolvedSettings.
+
+    Scales working area to the tensor resolution of padded_size,
+    then delegates to rect_tiling().
+    """
+    work_w, work_h = resolved.work_at(padded_size[0], padded_size[1])
+    return rect_tiling(x, y, padded_size, work_w, work_h)

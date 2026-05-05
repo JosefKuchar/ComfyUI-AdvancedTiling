@@ -6,14 +6,21 @@ so boundary patches structurally "see" opposite-edge content as spatially adjace
 Analogous to how Conv2d circular padding works for UNet models.
 """
 
+import functools
+
 import torch
 
-from .modes import Settings
+from .modes import ResolvedSettings
 from .modes.hex import hex_tiling
+from .modes.rect import rect_tiling
 
 
 def _factorize(n: int) -> tuple[int, int]:
-    """Factorize n into h * w, preferring square."""
+    """Factorize n into h * w, preferring square.
+
+    For prime n, returns (1, n) — callers should assume latent sizes are
+    highly composite (powers of 2) in practice.
+    """
     s = int(n ** 0.5)
     while s > 0:
         if n % s == 0:
@@ -26,13 +33,12 @@ def _factorize(n: int) -> tuple[int, int]:
 # Hex toroidal attention
 # ---------------------------------------------------------------------------
 
-_boundary_cache: dict = {}
 
-
+@functools.lru_cache(maxsize=32)
 def _compute_hex_boundary_pairs(
     h_patches: int,
     w_patches: int,
-    settings: Settings,
+    resolved: ResolvedSettings,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute hex boundary neighbor relationships at patch granularity.
@@ -41,17 +47,13 @@ def _compute_hex_boundary_pairs(
     the hex, record the boundary patch index, the wrapped source index,
     and the direction offset.
 
-    Cached by (h_patches, w_patches, hash(settings)).
+    Cached by (h_patches, w_patches, resolved).
 
     :param h_patches: Number of patch rows
     :param w_patches: Number of patch columns
-    :param settings: Tiling settings
+    :param resolved: Resolved tiling settings with pre-computed values
     :return: (boundary_idx, source_idx, off_h, off_w) as LongTensors
     """
-    cache_key = (h_patches, w_patches, hash(settings))
-    if cache_key in _boundary_cache:
-        return _boundary_cache[cache_key]
-
     boundary_idx = []
     source_idx = []
     offsets_h = []
@@ -62,8 +64,8 @@ def _compute_hex_boundary_pairs(
             src_w, src_h = hex_tiling(
                 w, h,
                 (w_patches, h_patches),
-                (w_patches, h_patches),
-                settings,
+                resolved.hex_size_patch,
+                resolved.rotation,
             )
             if src_w != w or src_h != h:
                 continue
@@ -74,8 +76,8 @@ def _compute_hex_boundary_pairs(
                 n_src_w, n_src_h = hex_tiling(
                     nw, nh,
                     (w_patches, h_patches),
-                    (w_patches, h_patches),
-                    settings,
+                    resolved.hex_size_patch,
+                    resolved.rotation,
                 )
 
                 if n_src_w != nw or n_src_h != nh:
@@ -95,7 +97,6 @@ def _compute_hex_boundary_pairs(
             torch.tensor(offsets_w, dtype=torch.long),
         )
 
-    _boundary_cache[cache_key] = result
     return result
 
 
@@ -103,29 +104,19 @@ def _compute_hex_boundary_pairs(
 # Rectangular toroidal attention
 # ---------------------------------------------------------------------------
 
-_rect_boundary_cache: dict = {}
 
-
+@functools.lru_cache(maxsize=32)
 def _compute_rect_boundary_pairs(
     h_patches: int,
     w_patches: int,
+    resolved: ResolvedSettings,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute rectangular boundary pairs using pre-computed working area.
+
+    Uses rect_tiling() for boundary detection, matching hex pattern.
+
+    Cached by (h_patches, w_patches, resolved).
     """
-    Compute rectangular boundary pairs for toroidal wrapping.
-
-    For each patch on the edge of the grid, records the boundary patch index,
-    the wrapped source index from the opposite edge, and the direction offset.
-
-    Cached by (h_patches, w_patches).
-
-    :param h_patches: Number of patch rows
-    :param w_patches: Number of patch columns
-    :return: (boundary_idx, source_idx, off_h, off_w) as LongTensors
-    """
-    cache_key = (h_patches, w_patches)
-    if cache_key in _rect_boundary_cache:
-        return _rect_boundary_cache[cache_key]
-
     boundary_idx = []
     source_idx = []
     offsets_h = []
@@ -133,15 +124,28 @@ def _compute_rect_boundary_pairs(
 
     for h in range(h_patches):
         for w in range(w_patches):
+            src_w, src_h = rect_tiling(
+                w, h,
+                (w_patches, h_patches),
+                resolved.work_patch_w,
+                resolved.work_patch_h,
+            )
+            if src_w != w or src_h != h:
+                continue
+
             for dh, dw in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
                 nh, nw = h + dh, w + dw
 
-                if nh < 0 or nh >= h_patches or nw < 0 or nw >= w_patches:
-                    wrapped_h = nh % h_patches
-                    wrapped_w = nw % w_patches
+                n_src_w, n_src_h = rect_tiling(
+                    nw, nh,
+                    (w_patches, h_patches),
+                    resolved.work_patch_w,
+                    resolved.work_patch_h,
+                )
 
+                if n_src_w != nw or n_src_h != nh:
                     boundary_idx.append(h * w_patches + w)
-                    source_idx.append(wrapped_h * w_patches + wrapped_w)
+                    source_idx.append(n_src_h * w_patches + n_src_w)
                     offsets_h.append(dh)
                     offsets_w.append(dw)
 
@@ -156,7 +160,6 @@ def _compute_rect_boundary_pairs(
             torch.tensor(offsets_w, dtype=torch.long),
         )
 
-    _rect_boundary_cache[cache_key] = result
     return result
 
 
@@ -167,8 +170,9 @@ def _compute_rect_boundary_pairs(
 class _BaseToroidalAttentionPatch:
     """Shared logic for hex and rectangular toroidal attention patches."""
 
-    def __init__(self, pe_embedder):
+    def __init__(self, pe_embedder, resolved: ResolvedSettings):
         self.pe_embedder = pe_embedder
+        self.resolved = resolved
         self._initialized = False
         self._boundary_idx = None
         self._source_idx = None
@@ -252,16 +256,91 @@ class _BaseToroidalAttentionPatch:
 class HexToroidalAttentionPatch(_BaseToroidalAttentionPatch):
     """attn1_patch for hex tiling: injects wrapped K/V for hex boundary patches."""
 
-    def __init__(self, settings: Settings, pe_embedder):
-        super().__init__(pe_embedder)
-        self.settings = settings
+    def __init__(self, resolved: ResolvedSettings, pe_embedder):
+        super().__init__(pe_embedder, resolved)
 
     def _compute_boundary_pairs(self, h_patches, w_patches):
-        return _compute_hex_boundary_pairs(h_patches, w_patches, self.settings)
+        return _compute_hex_boundary_pairs(h_patches, w_patches, self.resolved)
 
 
 class RectToroidalAttentionPatch(_BaseToroidalAttentionPatch):
     """attn1_patch for rectangular tiling: injects wrapped K/V from opposite edges."""
 
+    def __init__(self, resolved: ResolvedSettings, pe_embedder):
+        super().__init__(pe_embedder, resolved)
+
     def _compute_boundary_pairs(self, h_patches, w_patches):
-        return _compute_rect_boundary_pairs(h_patches, w_patches)
+        return _compute_rect_boundary_pairs(h_patches, w_patches, self.resolved)
+
+
+# ---------------------------------------------------------------------------
+# Lumina waste/margin token reset patch
+# ---------------------------------------------------------------------------
+
+class LuminaWastePatch:
+    """double_block patch that replaces waste/margin tokens with their
+    mapped source content after each transformer block, preventing garbage
+    accumulation from polluting attention for working-area patches.
+
+    For Hexagon mode: uses hex_tiling to identify waste positions (outside hex)
+    and their hex source positions.
+    For Rectangular mode: identifies margin positions (outside working rectangle)
+    and maps them to the opposite edge of the working rectangle.
+    """
+
+    def __init__(self, patch_size: int, resolved: ResolvedSettings):
+        self.patch_size = patch_size
+        self.resolved = resolved
+        self._initialized = False
+        self._waste_idx = None
+        self._waste_source_idx = None
+
+    def _initialize(self, x: torch.Tensor):
+        _, _, H, W = x.shape
+        h_patches = H // self.patch_size
+        w_patches = W // self.patch_size
+
+        waste_indices = []
+        waste_source_indices = []
+
+        if self.resolved.mode == "Hexagon":
+            for h in range(h_patches):
+                for w in range(w_patches):
+                    src_w, src_h = hex_tiling(
+                        w, h,
+                        (w_patches, h_patches),
+                        self.resolved.hex_size_patch,
+                        self.resolved.rotation,
+                    )
+                    if src_w != w or src_h != h:
+                        waste_indices.append(h * w_patches + w)
+                        waste_source_indices.append(src_h * w_patches + src_w)
+        else:  # Rectangular
+            for h in range(h_patches):
+                for w in range(w_patches):
+                    src_w, src_h = rect_tiling(
+                        w, h,
+                        (w_patches, h_patches),
+                        self.resolved.work_patch_w,
+                        self.resolved.work_patch_h,
+                    )
+                    if src_w != w or src_h != h:
+                        waste_indices.append(h * w_patches + w)
+                        waste_source_indices.append(src_h * w_patches + src_w)
+
+        if waste_indices:
+            self._waste_idx = torch.tensor(waste_indices, dtype=torch.long)
+            self._waste_source_idx = torch.tensor(waste_source_indices, dtype=torch.long)
+
+        self._initialized = True
+
+    def __call__(self, data: dict) -> dict:
+        if not self._initialized:
+            self._initialize(data["x"])
+
+        if self._waste_idx is None:
+            return {}
+
+        img = data["img"]
+        img[:, self._waste_idx, :] = img[:, self._waste_source_idx, :]
+        return {"img": img}

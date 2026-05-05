@@ -24,12 +24,9 @@
 
 - [x] FLUX.2 — tested on flux.2-klein-4b
 - [x] Qwen Image — tested on qwen-image-2512 (Q6 GGUF and fp16)
+- [ ] Z-Image / Z-Image Turbo — works with artifacts; wrapping not always consistent, especially at lower scales (~0.87). Less artifacts at higher scales (~0.95).
 
-DiT models are automatically detected and use toroidal attention instead of latent padding for seamless tiling.
-
-## TODO
-
-- Optimize VAE decode (first pass is very slow)
+DiT models are automatically detected and use toroidal attention instead of latent padding for seamless tiling. Lumina/Z-Image models use latent wrapping only (toroidal attention causes boundary noise with multiplicative RoPE).
 
 ## Credits
 

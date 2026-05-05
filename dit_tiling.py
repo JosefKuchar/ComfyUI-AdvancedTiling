@@ -1,23 +1,28 @@
 """
 DiT model tiling via toroidal attention and latent wrapping.
 
+Applies toroidal attention (K/V injection at boundary patches) combined with
+latent wrapping (filling margin/waste positions with content from opposite edges
+on each denoising step). The combination provides seamless infinite tiling:
+- Toroidal attention makes boundary patches attend to opposite-edge content
+- Latent wrapping provides spatial context at the edges for the model
+
 For Hexagon mode:
-- Toroidal attention: injects wrapped-neighbor K/V entries into every attention
-  layer, making boundary patches structurally "see" opposite-edge content as
-  spatially adjacent.
-- Latent wrapping: copies source content to waste positions in the input latent
-  on each denoising step (for KSampler preview).
+- Toroidal attention + latent wrapping using hex coordinate mapping
+- Waste positions (outside hex) filled with hex source content
 
 For Rectangular mode:
-- Toroidal attention: injects wrapped K/V entries from opposite edges (right↔left,
-  top↔bottom).
+- Toroidal attention + latent wrapping using scale-based margins
+- The working rectangle is centered in the latent with margins on all sides
+- Margin positions filled with content from opposite edges of working rectangle
+- VAE decoder crops output to the working rectangle
 """
 
 import torch
 import torch.nn as nn
 from torch.nn import Conv2d
 
-from .modes import Settings
+from .modes import ResolvedSettings
 
 
 def _has_conv2d(model: nn.Module) -> bool:
@@ -25,83 +30,122 @@ def _has_conv2d(model: nn.Module) -> bool:
     return any(isinstance(m, Conv2d) for m in model.modules())
 
 
-def _create_content_wrapper(settings: Settings):
-    """
-    Create a model function wrapper that copies source content to waste
-    positions in the latent on each denoising step. This makes the KSampler
-    preview show wrapped content instead of noise.
+def _apply_latent_wrapping(x: torch.Tensor, resolved: ResolvedSettings):
+    """Fill margin/waste positions with content from opposite edges.
 
-    Only used for Hexagon mode.
-
-    :param settings: Tiling settings
+    Relies on calculate_mapping's @functools.cache for memoization.
     """
     from .advanced_tiling import calculate_mapping
 
-    _mapping_cache = {}
+    is_5d = x.ndim == 5
+    if is_5d:
+        _, _, _, H, W = x.shape
+    else:
+        _, _, H, W = x.shape
 
+    mapping = calculate_mapping((W, H), (W, H), resolved)
+
+    if is_5d:
+        x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
+    else:
+        x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
+
+
+def _create_content_wrapper(resolved: ResolvedSettings):
+    """Create a model function wrapper that applies latent wrapping each step."""
     def wrapper(apply_model, args):
-        x = args["input"]
-        is_5d = x.ndim == 5
-
-        if is_5d:
-            _, _, _, H, W = x.shape
-        else:
-            _, _, H, W = x.shape
-
-        cache_key = (W, H, hash(settings))
-        if cache_key not in _mapping_cache:
-            _mapping_cache[cache_key] = calculate_mapping(
-                (W, H), (W, H), settings
-            )
-        mapping = _mapping_cache[cache_key]
-
-        # Content replacement in latent
-        if is_5d:
-            x[:, :, :, mapping[1], mapping[0]] = x[:, :, :, mapping[3], mapping[2]]
-        else:
-            x[:, :, mapping[1], mapping[0]] = x[:, :, mapping[3], mapping[2]]
-
+        _apply_latent_wrapping(args["input"], resolved)
         return apply_model(args["input"], args["timestep"], **args["c"])
-
+    wrapper._is_tiling_wrapper = True
     return wrapper
 
 
-def patch_dit_model(model_patcher, settings: Settings):
+def _create_lumina_wrapper(resolved: ResolvedSettings):
+    """Model wrapper for Lumina: applies latent content wrapping on each step."""
+    def wrapper(apply_model, args):
+        _apply_latent_wrapping(args["input"], resolved)
+        return apply_model(args["input"], args["timestep"], **args["c"])
+    wrapper._is_tiling_wrapper = True
+    return wrapper
+
+
+def _is_lumina(diff_model) -> bool:
+    """Check if the model uses Lumina/NextDiT architecture (rope_embedder instead of pe_embedder)."""
+    return hasattr(diff_model, 'rope_embedder') and not hasattr(diff_model, 'pe_embedder')
+
+
+def _patch_lumina(model_patcher, diff_model, resolved: ResolvedSettings):
+    """Set up tiling for Lumina/NextDiT models.
+
+    Two mechanisms work together:
+    1. Latent wrapping (model function wrapper): fills margin/waste positions
+       with content from opposite edges on each denoising step.
+    2. Waste token reset (double_block_patch): resets waste tokens to their
+       source content after each transformer block, preventing garbage
+       accumulation from polluting attention for working-area patches.
+    """
+    patch_size = diff_model.patch_size
+
+    # 1. Latent wrapping
+    wrapper = _create_lumina_wrapper(resolved)
+    model_patcher.set_model_unet_function_wrapper(wrapper)
+
+    # 2. Waste token reset
+    from .toroidal_attention import LuminaWastePatch
+    waste_patch = LuminaWastePatch(patch_size, resolved)
+    model_patcher.set_model_double_block_patch(waste_patch)
+
+
+def patch_dit_model(model_patcher, resolved: ResolvedSettings):
     """
     Apply tiling to a DiT model.
 
-    For Hexagon mode: applies toroidal attention + latent content wrapping.
-    For Rectangular mode: applies toroidal attention only.
+    Flux-style models (pe_embedder): attn1_patch for K/V injection + latent wrapping.
+    Lumina/NextDiT models (rope_embedder): latent wrapping only (K/V injection
+    causes boundary noise with multiplicative RoPE).
+
+    For Hexagon mode: uses hex coordinate mapping for waste positions.
+    For Rectangular mode: uses scale-based margins centered in the latent.
 
     :param model_patcher: ComfyUI ModelPatcher instance
-    :param settings: Tiling settings
+    :param resolved: Resolved tiling settings with pre-computed values
     """
     diff_model = model_patcher.model.diffusion_model
 
-    if settings.mode == "Hexagon":
-        from .toroidal_attention import HexToroidalAttentionPatch
+    if resolved.mode == "Hexagon":
+        if _is_lumina(diff_model):
+            _patch_lumina(model_patcher, diff_model, resolved)
 
-        if not hasattr(diff_model, 'pe_embedder'):
+        elif hasattr(diff_model, 'pe_embedder'):
+            from .toroidal_attention import HexToroidalAttentionPatch
+
+            patch = HexToroidalAttentionPatch(resolved, diff_model.pe_embedder)
+            model_patcher.set_model_attn1_patch(patch)
+
+            wrapper = _create_content_wrapper(resolved)
+            model_patcher.set_model_unet_function_wrapper(wrapper)
+
+        else:
             raise ValueError(
-                "Model does not have pe_embedder. "
+                "Model does not have pe_embedder or rope_embedder. "
                 "Toroidal attention requires a model with RoPE position embeddings."
             )
 
-        patch = HexToroidalAttentionPatch(settings, diff_model.pe_embedder)
-        model_patcher.set_model_attn1_patch(patch)
+    elif resolved.mode == "Rectangular":
+        if _is_lumina(diff_model):
+            _patch_lumina(model_patcher, diff_model, resolved)
 
-        # Latent content wrapping for KSampler preview
-        wrapper = _create_content_wrapper(settings)
-        model_patcher.set_model_unet_function_wrapper(wrapper)
+        elif hasattr(diff_model, 'pe_embedder'):
+            from .toroidal_attention import RectToroidalAttentionPatch
 
-    elif settings.mode == "Rectangular":
-        from .toroidal_attention import RectToroidalAttentionPatch
+            patch = RectToroidalAttentionPatch(resolved, diff_model.pe_embedder)
+            model_patcher.set_model_attn1_patch(patch)
 
-        if not hasattr(diff_model, 'pe_embedder'):
+            wrapper = _create_content_wrapper(resolved)
+            model_patcher.set_model_unet_function_wrapper(wrapper)
+
+        else:
             raise ValueError(
-                "Model does not have pe_embedder. "
+                "Model does not have pe_embedder or rope_embedder. "
                 "Toroidal attention requires a model with RoPE position embeddings."
             )
-
-        patch = RectToroidalAttentionPatch(diff_model.pe_embedder)
-        model_patcher.set_model_attn1_patch(patch)
